@@ -1,0 +1,300 @@
+---
+title: "Modeling"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(modelr)
+library(broom)
+doParallel::registerDoParallel()
+```
+
+```{r}
+# df_all_only_total_na <- read_csv("./data/processed/combined_total_na.csv")
+# df_all_only_total <- read_csv("./data/processed/combined_total.csv")
+# 
+# df_all_only_enteric_na <- read_csv("./data/processed/combined_enteric.csv")
+# df_all_only_enteric <- read_csv("./data/processed/combined_enteric.csv")
+df_livestock_patterns <- read_csv("./data/processed/df_livestock_patterns.csv")
+```
+
+```{r}
+# df_all_only_total <-
+#   df_all_only_total_na %>%
+#   # filter(Area == c("United States of America")) %>%
+#   select_if(~ !any(is.na(.))) %>%
+#   filter(Year >= 1990)
+  # replace(is.na(.), 0) %>%
+  # select()
+# -contains("Area harvested"), -contains("Production") contains("CO2"), Year, Area, contains("Yield") , -contains("Stocks")
+df_all_only_total <-
+  df_livestock_patterns %>% 
+  # filter(Area == "United States of America") %>%
+  # select_if(~ !any(is.na(.)))
+  replace(is.na(.), 0) %>% 
+  filter(CO2 != 0) %>%
+  select(-contains("and"), -contains("Major"))
+  # filter(Year >= 1970)
+
+df_all_only_total
+
+# df_all_only_enteric <-
+  # df_all_only_enteric %>%
+  # filter(Area == "United States of America")
+#   df_all_only_enteric_na %>%
+#   filter(Area == "United States of America") %>%
+#   select_if(~ !any(is.na(.)))
+# df_all_only_enteric
+```
+
+
+```{r}
+emissions_split = initial_split(df_all_only_total, prop = 0.8)
+emissions_train = training(emissions_split)
+emissions_test = testing(emissions_split)
+emissions_train
+emissions_test
+```
+
+```{r}
+emissions_rec <-
+  # recipe(`Enteric Fermentation|CO2` ~ ., data = emissions_train) %>%
+  recipe(`CO2` ~ ., data = emissions_train) %>%
+  step_rm(Year, Area, Item) %>%
+  step_zv(all_numeric(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes())
+
+emissions_prep <-
+  emissions_rec %>%
+  prep()
+```
+
+```{r}
+lasso_spec <-
+  linear_reg(penalty = 0.1, mixture=1) %>%
+  set_engine("glmnet")
+
+wf <-
+  workflow() %>%
+  add_recipe(emissions_rec)
+
+lasso_fit <-
+  wf %>%
+  add_model(lasso_spec) %>%
+  fit(data = emissions_train)
+
+df_coeff <-
+  lasso_fit %>%
+  pull_workflow_fit() %>%
+  tidy()
+df_coeff
+```
+
+```{r}
+df_coeff %>%
+  arrange(desc(estimate)) %>%
+  filter(term != "(Intercept)")
+```
+
+```{r}
+df_coeff %>% 
+  mutate(
+    term = fct_reorder(term, estimate)
+  ) %>% 
+  arrange(desc(abs(estimate))) %>% 
+  filter(term != "(Intercept)") %>%
+  # head(30) %>%
+  # filter(estimate > 0) %>%
+  ggplot(aes(
+      x = estimate,
+      y = term
+    )) +
+  geom_col() +
+  labs(
+    x = "Correlation",
+    y = "Animal",
+    title = ""
+  )
+```
+
+```{r}
+emissions_boot <- bootstraps(emissions_train, 100)
+
+tune_spec <-
+  linear_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+lambda_grid <- grid_regular(penalty(), levels = 50)
+```
+
+```{r}
+lasso_grid <-
+  tune_grid(
+    wf %>% add_model(tune_spec),
+    resamples = emissions_boot,
+    grid = lambda_grid
+  )
+```
+
+```{r}
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+```{r}
+lowest_rmse <- lasso_grid %>%
+  select_best("rmse", maximize = FALSE)
+
+final_lasso <- finalize_workflow(
+  wf %>% add_model(tune_spec),
+  lowest_rmse
+)
+```
+
+```{r}
+last_fit(
+  final_lasso,
+  emissions_split
+) %>%
+  collect_metrics()
+```
+
+```{r}
+folds <- vfold_cv(emissions_train, v = 10)
+
+results <-
+  fit_resamples(
+    final_lasso,
+    folds
+  ) %>%
+  collect_metrics()
+results
+```
+
+```{r}
+confidence_level = 0.95
+
+stat <- results %>% filter(.metric == "rmse")
+lo <- pull(stat, "mean") - qnorm( 1 - (1 - confidence_level) / 2 ) * pull(stat, "std_err")
+hi <- pull(stat, "mean") + qnorm( 1 - (1 - confidence_level) / 2 ) * pull(stat, "std_err")
+lo
+hi
+
+stat <- results %>% filter(.metric == "rsq")
+lo <- pull(stat, "mean") - qnorm( 1 - (1 - confidence_level) / 2 ) * pull(stat, "std_err")
+hi <- pull(stat, "mean") + qnorm( 1 - (1 - confidence_level) / 2 ) * pull(stat, "std_err")
+lo
+hi
+
+```
+
+```{r}
+predictions <-
+  collect_predictions(
+    last_fit(
+      final_lasso,
+      emissions_split,
+    )
+  ) %>%
+  pull(".pred")
+
+testing(emissions_split) %>%
+  mutate("Predicted CO2" = predictions) %>%
+  # filter(Area == "United States of America") %>%
+  filter(CO2 < 500000) %>%
+  ggplot(aes(CO2, `Predicted CO2`)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "grey")
+
+emissions_test %>%
+  mutate("Predicted CO2" = predictions) %>%
+  # filter(Area == "United States of America") %>%
+  filter(CO2 < 1000000) %>%
+  pivot_longer(
+    cols = c("CO2", "Predicted CO2"),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = Year)) +
+  geom_point(aes(y = value)) +
+  facet_wrap(~ metric)
+```
+
+```{r}
+df_all_only_total %>% 
+  # filter(Area == "United States of America") %>%
+  group_by(Area) %>%
+  mutate(tmp = sum(CO2)) %>%
+  ungroup() %>%
+  mutate(rank = dense_rank(desc(tmp))) %>%
+  filter(rank > 10 & rank < 100) %>%
+  select(-rank, -tmp) %>%
+  mutate(
+    `Cattle` = (`Cattle` - min(`Cattle`)) /
+      (max(`Cattle`) - min(`Cattle`))) %>%
+  mutate(
+    `CO2` = (`CO2` - min(`CO2`)) /
+      (max(`CO2`) - min(`CO2`))) %>%
+  ggplot(aes(
+    x = as.numeric(Year)
+  )) +
+  geom_line(aes(
+    y = `Cattle`,
+    color = "Cattle"
+  )) +
+  geom_line(aes(
+    y = `CO2`,
+    color = "Emissions"
+  )) +
+  facet_wrap(~ Area) +
+  scale_color_manual(values = c("Cattle" = "red", "Emissions" = "black"))
+  # labs(
+  #   x = "Time (years)",
+  #   y = "Normalized Metric",
+  #   title = "Cattle vs Emissions over Time (Normalized)"
+  # ) +
+  # theme(legend.position="bottom", legend.box = "horizontal")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
