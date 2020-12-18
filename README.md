@@ -1,5 +1,6 @@
 # Predicting Agricultural Emissions
 ### By Yehya Albakri and Eamon Ito-Fisher
+------------------------------------
 
   - [Background](#background)
   - [Question](#question)
